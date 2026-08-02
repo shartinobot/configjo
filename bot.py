@@ -1,644 +1,432 @@
-"""
-ربات تلگرام فروش کانفیگ (VPN/پروکسی)
-نسخه کامل با پشتیبانی از خرید اشتراک، پشتیبانی، آموزش و نمایندگی
-قابل اجرا روی Render با Flask Web Server
-"""
+# ============================================
+# ربات تلگرام فروش کانفیگ
+# با python-telegram-bot==20.6 و Flask==2.3.3
+# استایل: Functional + async/await
+# دیتابیس: JSON
+# اجرا: Polling + Thread برای Flask
+# ============================================
 
 import os
-import logging
+import sys
 import json
-import uuid
+import logging
+import threading
+import time
 from datetime import datetime
-from typing import Dict, Optional, Tuple
-from threading import Thread
+from dotenv import load_dotenv
+
+# ===== کتابخانه‌های اصلی =====
 from flask import Flask, jsonify
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+# ===== بارگذاری متغیرهای محیطی =====
+load_dotenv()
 
-# -------------------- تنظیمات اولیه --------------------
-# دریافت توکن از متغیرهای محیطی
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+PORT = int(os.environ.get("PORT", 8080))
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+
 if not BOT_TOKEN:
-    raise ValueError("توکن ربات پیدا نشد! لطفاً متغیر محیطی BOT_TOKEN را تنظیم کنید.")
+    print("❌ BOT_TOKEN تنظیم نشده!")
+    sys.exit(1)
 
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-if ADMIN_ID == 0:
-    raise ValueError("ADMIN_ID تنظیم نشده است!")
-
-CHANNEL_ID = os.environ.get("CHANNEL_ID")  # اختیاری
-
-# فعال کردن لاگ
+# ===== تنظیمات لاگ =====
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- دیتابیس JSON --------------------
-USERS_FILE = "users_data.json"
+# ===== دیتابیس JSON =====
+DATA_FILE = "users_data.json"
 
-def load_users() -> Dict:
-    """بارگذاری اطلاعات کاربران از فایل"""
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+def load_data():
+    try:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
 
-def save_users(users: Dict):
-    """ذخیره اطلاعات کاربران در فایل"""
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-def get_user(user_id: int) -> Dict:
-    """دریافت اطلاعات یک کاربر"""
-    users = load_users()
-    if str(user_id) not in users:
-        users[str(user_id)] = {
-            "username": "",
+# ===== قیمت‌ها (قابل تغییر) =====
+PRICES = {
+    "5gb": 5000,
+    "10gb": 8000,
+    "20gb": 14000,
+    "50gb": 30000,
+    "1month": 15000,
+    "3month": 40000,
+    "6month": 70000,
+    "1year": 120000,
+}
+
+VOLUME_BUTTONS = [
+    ("🔵 ۵ گیگ", "5gb"),
+    ("🟢 ۱۰ گیگ", "10gb"),
+    ("🔴 ۲۰ گیگ", "20gb"),
+    ("🟣 ۵۰ گیگ", "50gb"),
+]
+
+TIME_BUTTONS = [
+    ("🔵 ۱ ماهه", "1month"),
+    ("🟢 ۳ ماهه", "3month"),
+    ("🔴 ۶ ماهه", "6month"),
+    ("🟣 ۱ ساله", "1year"),
+]
+
+# ============================================
+# کیبوردها
+# ============================================
+
+def get_main_keyboard():
+    return ReplyKeyboardMarkup([
+        ["📌 خرید اشتراک", "🟢 پشتیبانی"],
+        ["📖 آموزش", "🟣 درخواست نمایندگی"]
+    ], resize_keyboard=True)
+
+def get_purchase_keyboard():
+    return ReplyKeyboardMarkup([
+        ["🔵 اشتراک حجمی", "🟢 اشتراک زمانی"],
+        ["🔴 بازگشت"]
+    ], resize_keyboard=True)
+
+def get_volume_keyboard():
+    buttons = []
+    row = []
+    for label, key in VOLUME_BUTTONS:
+        price = PRICES[key]
+        row.append(KeyboardButton(f"{label} - {price:,} تومان"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append(["🔴 بازگشت"])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def get_time_keyboard():
+    buttons = []
+    row = []
+    for label, key in TIME_BUTTONS:
+        price = PRICES[key]
+        row.append(KeyboardButton(f"{label} - {price:,} تومان"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append(["🔴 بازگشت"])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def get_payment_keyboard():
+    return ReplyKeyboardMarkup([
+        ["📸 ارسال رسید"],
+        ["🔴 بازگشت"]
+    ], resize_keyboard=True)
+
+# ============================================
+# هندلرهای ربات
+# ============================================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
+    username = user.username or "ندارد"
+    
+    # ذخیره کاربر
+    data = load_data()
+    if user_id not in data:
+        data[user_id] = {
+            "username": username,
             "first_seen": datetime.now().isoformat(),
             "last_active": datetime.now().isoformat(),
             "subscription": None,
-            "last_choice": {},
             "tickets": [],
-            "receipts": [],
-            "pending_payment": None
+            "receipts": []
         }
-        save_users(users)
-    return users[str(user_id)]
-
-def update_user(user_id: int, data: Dict):
-    """به‌روزرسانی اطلاعات کاربر"""
-    users = load_users()
-    if str(user_id) not in users:
-        users[str(user_id)] = {}
-    users[str(user_id)].update(data)
-    save_users(users)
-
-# -------------------- قیمت‌ها --------------------
-VOLUME_PLANS = {
-    "5gb": {"label": "🔵 ۵ گیگ", "price": 5000},
-    "10gb": {"label": "🔵 ۱۰ گیگ", "price": 8000},
-    "20gb": {"label": "🔵 ۲۰ گیگ", "price": 14000},
-    "50gb": {"label": "🔵 ۵۰ گیگ", "price": 30000},
-}
-
-TIME_PLANS = {
-    "1m": {"label": "🟢 ۱ ماه", "price": 15000},
-    "3m": {"label": "🟢 ۳ ماه", "price": 40000},
-    "6m": {"label": "🟢 ۶ ماه", "price": 70000},
-    "12m": {"label": "🟢 ۱ سال", "price": 120000},
-}
-
-# اطلاعات بانکی
-BANK_INFO = {
-    "card_number": "6037-9975-1234-5678",
-    "account_name": "علی رضایی",
-    "bank_name": "بانک ملی"
-}
-
-# -------------------- توابع کمکی --------------------
-def generate_ticket_id() -> int:
-    """تولید شماره تیکت جدید"""
-    return int(datetime.now().timestamp()) % 1000000
-
-def format_date(date_str: str) -> str:
-    """فرمت تاریخ"""
-    try:
-        dt = datetime.fromisoformat(date_str)
-        return dt.strftime("%Y/%m/%d %H:%M")
-    except:
-        return date_str
-
-# -------------------- منوی اصلی --------------------
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی اصلی"""
-    keyboard = [
-        [InlineKeyboardButton("📌 خرید اشتراک", callback_data="buy")],
-        [InlineKeyboardButton("🟢 پشتیبانی", callback_data="support")],
-        [InlineKeyboardButton("📖 آموزش", callback_data="guide")],
-        [InlineKeyboardButton("🟣 درخواست نمایندگی", callback_data="agency")],
-    ]
-    await update.callback_query.edit_message_text(
-        "🤖 به ربات فروش کانفیگ خوش آمدید!\n\n"
-        "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-# -------------------- دستور /start --------------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هندلر دستور /start"""
-    user = update.effective_user
-    user_id = user.id
+        save_data(data)
+        logger.info(f"✅ کاربر جدید: {username} ({user_id})")
     
-    # ثبت کاربر
-    user_data = get_user(user_id)
-    user_data["username"] = user.username or ""
-    user_data["last_active"] = datetime.now().isoformat()
-    update_user(user_id, user_data)
+    data[user_id]["last_active"] = datetime.now().isoformat()
+    save_data(data)
     
-    keyboard = [
-        [InlineKeyboardButton("📌 خرید اشتراک", callback_data="buy")],
-        [InlineKeyboardButton("🟢 پشتیبانی", callback_data="support")],
-        [InlineKeyboardButton("📖 آموزش", callback_data="guide")],
-        [InlineKeyboardButton("🟣 درخواست نمایندگی", callback_data="agency")],
-    ]
-    
-    await update.message.reply_text(
-        "🤖 به ربات فروش کانفیگ خوش آمدید!\n\n"
-        "لطفاً یکی از گزینه‌های زیر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-# -------------------- خرید اشتراک --------------------
-async def buy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی خرید اشتراک"""
-    keyboard = [
-        [InlineKeyboardButton("🔵 اشتراک حجمی", callback_data="buy_volume")],
-        [InlineKeyboardButton("🟢 اشتراک زمانی", callback_data="buy_time")],
-        [InlineKeyboardButton("🔴 بازگشت", callback_data="main")],
-    ]
-    await update.callback_query.edit_message_text(
-        "📌 **خرید اشتراک**\n\n"
-        "نوع اشتراک مورد نظر خود را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def buy_volume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش اشتراک‌های حجمی"""
-    keyboard = []
-    for key, plan in VOLUME_PLANS.items():
-        keyboard.append([InlineKeyboardButton(
-            f"{plan['label']} - {plan['price']:,} تومان",
-            callback_data=f"select_volume_{key}"
-        )])
-    keyboard.append([InlineKeyboardButton("🔴 بازگشت", callback_data="buy")])
-    
-    await update.callback_query.edit_message_text(
-        "📊 **اشتراک حجمی**\n\n"
-        "یکی از حجم‌های زیر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def buy_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش اشتراک‌های زمانی"""
-    keyboard = []
-    for key, plan in TIME_PLANS.items():
-        keyboard.append([InlineKeyboardButton(
-            f"{plan['label']} - {plan['price']:,} تومان",
-            callback_data=f"select_time_{key}"
-        )])
-    keyboard.append([InlineKeyboardButton("🔴 بازگشت", callback_data="buy")])
-    
-    await update.callback_query.edit_message_text(
-        "📅 **اشتراک زمانی**\n\n"
-        "یکی از بازه‌های زمانی زیر را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def select_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """انتخاب پلن و نمایش اطلاعات پرداخت"""
-    query = update.callback_query
-    user_id = query.from_user.id
-    data = query.data
-    
-    # تشخیص نوع و کلید پلن
-    if data.startswith("select_volume_"):
-        plan_key = data.replace("select_volume_", "")
-        plan = VOLUME_PLANS[plan_key]
-        plan_type = "حجمی"
-    elif data.startswith("select_time_"):
-        plan_key = data.replace("select_time_", "")
-        plan = TIME_PLANS[plan_key]
-        plan_type = "زمانی"
-    else:
-        return
-    
-    # ذخیره انتخاب کاربر
-    user_data = get_user(user_id)
-    user_data["last_choice"] = {
-        "type": plan_type,
-        "key": plan_key,
-        "label": plan["label"],
-        "price": plan["price"]
-    }
-    user_data["pending_payment"] = {
-        "plan_type": plan_type,
-        "plan_key": plan_key,
-        "price": plan["price"],
-        "date": datetime.now().isoformat()
-    }
-    update_user(user_id, user_data)
-    
-    # نمایش اطلاعات پرداخت
-    keyboard = [
-        [InlineKeyboardButton("📸 ارسال رسید", callback_data="send_receipt")],
-        [InlineKeyboardButton("🔴 بازگشت", callback_data="buy")],
-    ]
-    
-    await query.edit_message_text(
-        f"💰 **تایید و پرداخت**\n\n"
-        f"نوع اشتراک: {plan_type}\n"
-        f"پلن: {plan['label']}\n"
-        f"مبلغ: {plan['price']:,} تومان\n\n"
-        f"🏦 **اطلاعات واریز:**\n"
-        f"شماره کارت: `{BANK_INFO['card_number']}`\n"
-        f"نام صاحب حساب: {BANK_INFO['account_name']}\n"
-        f"بانک: {BANK_INFO['bank_name']}\n\n"
-        f"پس از واریز، رسید را ارسال کنید.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def send_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت رسید از کاربر"""
-    user_id = update.effective_user.id
-    
-    # تنظیم state برای دریافت رسید
-    context.user_data["waiting_for_receipt"] = True
-    
-    keyboard = [[InlineKeyboardButton("🔴 انصراف", callback_data="buy")]]
-    await update.callback_query.edit_message_text(
-        "📸 **ارسال رسید**\n\n"
-        "لطفاً عکس رسید پرداخت خود را ارسال کنید.\n"
-        "برای انصراف، دکمه زیر را بزنید.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پردازش رسید ارسال شده"""
-    if not context.user_data.get("waiting_for_receipt"):
-        return
-    
-    user_id = update.effective_user.id
-    user_data = get_user(user_id)
-    
-    if not user_data.get("pending_payment"):
-        await update.message.reply_text("❌ خطا! لطفاً مجدداً تلاش کنید.")
-        return
-    
-    # دریافت عکس
-    photo = update.message.photo[-1]
-    file_id = photo.file_id
-    
-    # ثبت رسید
-    pending = user_data["pending_payment"]
-    receipt_data = {
-        "id": generate_ticket_id(),
-        "date": datetime.now().isoformat(),
-        "subscription": pending.get("plan_key", ""),
-        "price": pending.get("price", 0),
-        "status": "pending",
-        "photo_id": file_id
-    }
-    
-    if "receipts" not in user_data:
-        user_data["receipts"] = []
-    user_data["receipts"].append(receipt_data)
-    user_data["pending_payment"] = None
-    update_user(user_id, user_data)
-    
-    # ارسال به ادمین
-    await send_to_admin(
-        update,
-        f"💰 **رسید جدید**\n\n"
-        f"کاربر: @{update.effective_user.username or 'بدون نام'}\n"
-        f"آیدی: `{user_id}`\n"
-        f"اشتراک: {pending.get('plan_key', 'نامشخص')}\n"
-        f"مبلغ: {pending.get('price', 0):,} تومان\n"
-        f"تاریخ: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
+    welcome_text = (
+        "🏠 به ربات فروش کانفیگ خوش آمدید!\n\n"
+        "📌 برای خرید اشتراک، دریافت آموزش، "
+        "ارتباط با پشتیبانی یا ثبت درخواست نمایندگی، "
+        "از دکمه‌های زیر استفاده کنید.\n\n"
+        "⚡ سریع و آسان!"
     )
     
-    # ارسال عکس رسید به ادمین
-    await context.bot.send_photo(chat_id=ADMIN_ID, photo=file_id)
-    
-    # پیام موفقیت به کاربر
-    context.user_data["waiting_for_receipt"] = False
-    keyboard = [[InlineKeyboardButton("🔴 بازگشت به منو", callback_data="main")]]
-    await update.message.reply_text(
-        "✅ **رسید شما با موفقیت ارسال شد!**\n\n"
-        "پس از تایید توسط ادمین، کانفیگ برای شما ارسال خواهد شد.\n"
-        "لطفاً صبور باشید.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard())
 
-# -------------------- پشتیبانی --------------------
-async def support_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی پشتیبانی"""
-    keyboard = [
-        [InlineKeyboardButton("📝 ارسال پیام", callback_data="send_ticket")],
-        [InlineKeyboardButton("🔴 بازگشت", callback_data="main")],
-    ]
-    await update.callback_query.edit_message_text(
-        "🟢 **پشتیبانی**\n\n"
-        "برای ارتباط با پشتیبانی، پیام خود را ارسال کنید.\n"
-        "شماره پیگیری دریافت خواهید کرد.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def send_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت پیام تیکت"""
-    user_id = update.effective_user.id
-    context.user_data["waiting_for_ticket"] = True
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    text = message.text
+    user = message.from_user
+    user_id = str(user.id)
     
-    keyboard = [[InlineKeyboardButton("🔴 انصراف", callback_data="support")]]
-    await update.callback_query.edit_message_text(
-        "📝 **ارسال تیکت**\n\n"
-        "لطفاً پیام خود را بنویسید و ارسال کنید.\n"
-        "پشتیبانی در اسرع وقت پاسخ خواهد داد.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def handle_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پردازش تیکت دریافتی"""
-    if not context.user_data.get("waiting_for_ticket"):
-        return
-    
-    user_id = update.effective_user.id
-    user_data = get_user(user_id)
-    ticket_id = generate_ticket_id()
-    ticket_text = update.message.text
-    
-    # ذخیره تیکت
-    ticket = {
-        "id": ticket_id,
-        "message": ticket_text,
-        "date": datetime.now().isoformat(),
-        "status": "open"
-    }
-    if "tickets" not in user_data:
-        user_data["tickets"] = []
-    user_data["tickets"].append(ticket)
-    update_user(user_id, user_data)
-    
-    # ارسال به ادمین
-    await send_to_admin(
-        update,
-        f"🎫 **تیکت جدید**\n\n"
-        f"شماره: `{ticket_id}`\n"
-        f"کاربر: @{update.effective_user.username or 'بدون نام'}\n"
-        f"آیدی: `{user_id}`\n"
-        f"تاریخ: {datetime.now().strftime('%Y/%m/%d %H:%M')}\n\n"
-        f"📝 متن:\n{ticket_text}"
-    )
-    
-    # پیام موفقیت به کاربر
-    context.user_data["waiting_for_ticket"] = False
-    keyboard = [[InlineKeyboardButton("🔴 بازگشت به منو", callback_data="main")]]
-    await update.message.reply_text(
-        f"✅ **تیکت شما با موفقیت ارسال شد!**\n\n"
-        f"شماره پیگیری: `{ticket_id}`\n"
-        f"به زودی پاسخ شما ارسال خواهد شد.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-# -------------------- آموزش --------------------
-async def guide_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش راهنمای آموزش"""
-    keyboard = [[InlineKeyboardButton("🔴 بازگشت", callback_data="main")]]
-    
-    guide_text = (
-        "📖 **آموزش اتصال به کانفیگ**\n\n"
-        "۱️⃣ فایل کانفیگ دریافتی را ذخیره کنید\n"
-        "۲️⃣ اپلیکیشن مورد نظر را اجرا کنید\n"
-        "۳️⃣ گزینه Import Config را انتخاب کنید\n"
-        "۴️⃣ فایل کانفیگ را انتخاب کنید\n"
-        "۵️⃣ دکمه Connect را بزنید\n\n"
-        "⚠️ **نکات مهم:**\n"
-        "• حتماً اینترنت خود را بررسی کنید\n"
-        "• در صورت مشکل، اپلیکیشن را ریستارت کنید\n"
-        "• اگر ارور داد، از پشتیبانی کمک بگیرید"
-    )
-    
-    await update.callback_query.edit_message_text(
-        guide_text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-# -------------------- درخواست نمایندگی --------------------
-async def agency_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی درخواست نمایندگی"""
-    keyboard = [
-        [InlineKeyboardButton("📝 ثبت درخواست", callback_data="request_agency")],
-        [InlineKeyboardButton("🔴 بازگشت", callback_data="main")],
-    ]
-    await update.callback_query.edit_message_text(
-        "🟣 **درخواست نمایندگی**\n\n"
-        "برای ثبت درخواست نمایندگی، لطفاً یوزرنیم تلگرام خود را وارد کنید.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def request_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت درخواست نمایندگی"""
-    user_id = update.effective_user.id
-    context.user_data["waiting_for_agency"] = True
-    
-    keyboard = [[InlineKeyboardButton("🔴 انصراف", callback_data="agency")]]
-    await update.callback_query.edit_message_text(
-        "🟣 **ثبت درخواست نمایندگی**\n\n"
-        "لطفاً یوزرنیم تلگرام خود را وارد کنید.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def handle_agency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پردازش درخواست نمایندگی"""
-    if not context.user_data.get("waiting_for_agency"):
-        return
-    
-    user_id = update.effective_user.id
-    username = update.message.text.strip()
-    
-    # ارسال به ادمین
-    await send_to_admin(
-        update,
-        f"🟣 **درخواست نمایندگی جدید**\n\n"
-        f"کاربر: @{update.effective_user.username or 'بدون نام'}\n"
-        f"آیدی: `{user_id}`\n"
-        f"یوزرنیم: {username}\n"
-        f"تاریخ: {datetime.now().strftime('%Y/%m/%d %H:%M')}"
-    )
-    
-    # پیام موفقیت
-    context.user_data["waiting_for_agency"] = False
-    keyboard = [[InlineKeyboardButton("🔴 بازگشت به منو", callback_data="main")]]
-    await update.message.reply_text(
-        "✅ **درخواست شما با موفقیت ثبت شد!**\n\n"
-        "پس از بررسی، با شما تماس گرفته خواهد شد.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-# -------------------- ارسال به ادمین --------------------
-async def send_to_admin(update: Update, text: str):
-    """ارسال پیام به ادمین"""
-    try:
-        await update.effective_message.bot.send_message(
+    # ===== پردازش عکس رسید =====
+    if message.photo:
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        
+        data = load_data()
+        user_choice = data.get(user_id, {}).get("last_choice", {})
+        
+        # ارسال به ادمین
+        await context.bot.send_photo(
             chat_id=ADMIN_ID,
-            text=text,
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"خطا در ارسال به ادمین: {e}")
-
-# -------------------- پاسخ ادمین --------------------
-async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پاسخ ادمین به کاربر"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ شما دسترسی به این دستور ندارید!")
-        return
-    
-    # پارس کردن دستور /reply [USER_ID] [متن]
-    text = update.message.text
-    parts = text.split(" ", 2)
-    if len(parts) < 3:
-        await update.message.reply_text(
-            "❌ فرمت صحیح:\n`/reply [USER_ID] [متن]`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    try:
-        user_id = int(parts[1])
-        reply_text = parts[2]
-    except ValueError:
-        await update.message.reply_text("❌ USER_ID باید عددی باشد!")
-        return
-    
-    # ارسال پاسخ به کاربر
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"📩 **پاسخ پشتیبانی:**\n\n{reply_text}",
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text(f"✅ پاسخ به کاربر {user_id} ارسال شد.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا: {e}")
-
-# -------------------- Callback Query Handler --------------------
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """هندلر کلیک روی دکمه‌ها"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    
-    if data == "main":
-        await show_main_menu(update, context)
-    elif data == "buy":
-        await buy_menu(update, context)
-    elif data == "buy_volume":
-        await buy_volume(update, context)
-    elif data == "buy_time":
-        await buy_time(update, context)
-    elif data.startswith("select_volume_") or data.startswith("select_time_"):
-        await select_plan(update, context)
-    elif data == "send_receipt":
-        await send_receipt(update, context)
-    elif data == "support":
-        await support_menu(update, context)
-    elif data == "send_ticket":
-        await send_ticket(update, context)
-    elif data == "guide":
-        await guide_menu(update, context)
-    elif data == "agency":
-        await agency_menu(update, context)
-    elif data == "request_agency":
-        await request_agency(update, context)
-    else:
-        await query.edit_message_text("❌ گزینه نامعتبر!")
-
-# -------------------- هندلر خطا --------------------
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """هندلر خطا"""
-    logger.error(f"خطا رخ داد: {context.error}")
-    if update and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "❌ خطایی رخ داد! لطفاً دوباره تلاش کنید."
+            photo=file_id,
+            caption=(
+                f"💰 رسید پرداخت جدید:\n\n"
+                f"👤 کاربر: @{user.username or 'ندارد'}\n"
+                f"🆔 آیدی: {user.id}\n"
+                f"📦 اشتراک: {user_choice.get('label', 'نامشخص')}\n"
+                f"💰 مبلغ: {user_choice.get('price', 0):,} تومان\n"
+                f"📅 زمان: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"⏳ در انتظار تایید..."
             )
-        except:
-            pass
+        )
+        
+        # ذخیره رسید
+        if user_id in data:
+            if "receipts" not in data[user_id]:
+                data[user_id]["receipts"] = []
+            data[user_id]["receipts"].append({
+                "date": datetime.now().isoformat(),
+                "subscription": user_choice.get("label", "نامشخص"),
+                "price": user_choice.get("price", 0),
+                "status": "pending"
+            })
+            save_data(data)
+        
+        await message.reply_text(
+            f"✅ رسید شما با موفقیت دریافت شد.\n\n"
+            f"💰 مبلغ: {user_choice.get('price', 0):,} تومان\n"
+            f"📦 اشتراک: {user_choice.get('label', 'نامشخص')}\n\n"
+            f"⏳ در حال بررسی توسط ادمین...\n"
+            f"🔹 ظرف ۵-۱۰ دقیقه تایید و کانفیگ رو دریافت میکنید.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
+    # ===== پردازش خرید حجمی =====
+    for label, key in VOLUME_BUTTONS:
+        price = PRICES[key]
+        if text == f"{label} - {price:,} تومان":
+            user_choice = {"type": "volume", "key": key, "label": label, "price": price}
+            data = load_data()
+            if user_id in data:
+                data[user_id]["last_choice"] = user_choice
+                save_data(data)
+            
+            await show_payment_page(update, user_choice)
+            return
+    
+    # ===== پردازش خرید زمانی =====
+    for label, key in TIME_BUTTONS:
+        price = PRICES[key]
+        if text == f"{label} - {price:,} تومان":
+            user_choice = {"type": "time", "key": key, "label": label, "price": price}
+            data = load_data()
+            if user_id in data:
+                data[user_id]["last_choice"] = user_choice
+                save_data(data)
+            
+            await show_payment_page(update, user_choice)
+            return
+    
+    # ===== دکمه‌های منو =====
+    if text == "📌 خرید اشتراک":
+        await message.reply_text("🛒 نوع اشتراک را انتخاب کنید:", reply_markup=get_purchase_keyboard())
+    
+    elif text == "🔵 اشتراک حجمی":
+        await message.reply_text("📦 انتخاب حجم اشتراک:", reply_markup=get_volume_keyboard())
+    
+    elif text == "🟢 اشتراک زمانی":
+        await message.reply_text("⏰ انتخاب مدت زمان اشتراک:", reply_markup=get_time_keyboard())
+    
+    elif text == "📸 ارسال رسید":
+        await message.reply_text(
+            "📸 لطفاً تصویر رسید یا کد پیگیری رو ارسال کنید:\n\n"
+            "می‌تونید:\n"
+            "• عکس از فیش واریزی\n"
+            "• یا کد پیگیری رو به صورت متن بفرستید\n\n"
+            "⚠️ حتماً مبلغ دقیق رو واریز کنید.",
+            reply_markup=ReplyKeyboardMarkup([["🔴 انصراف"]], resize_keyboard=True)
+        )
+    
+    elif text == "🟢 پشتیبانی":
+        await message.reply_text(
+            "✏️ لطفاً پیام خود را بنویسید:\n\n"
+            "📌 نکات:\n"
+            "• مشکل خود را دقیق شرح دهید\n"
+            "• اگر خطایی دریافت کردید، اسکرین‌شات بفرستید",
+            reply_markup=ReplyKeyboardMarkup([["🔴 بازگشت"]], resize_keyboard=True)
+        )
+    
+    elif text == "📖 آموزش":
+        await message.reply_text(
+            "📖 آموزش اتصال به کانفیگ:\n\n"
+            "۱️⃣ فایل کانفیگ دریافتی را ذخیره کنید\n"
+            "۲️⃣ اپلیکیشن مورد نظر را اجرا کنید\n"
+            "۳️⃣ گزینه Import Config را انتخاب کنید\n"
+            "۴️⃣ فایل کانفیگ را انتخاب کنید\n"
+            "۵️⃣ دکمه Connect را بزنید\n\n"
+            "⚠️ نکات مهم:\n"
+            "• حتماً اینترنت خود را بررسی کنید\n"
+            "• در صورت مشکل، اپلیکیشن را ریستارت کنید\n"
+            "• اگر ارور داد، از پشتیبانی کمک بگیرید",
+            reply_markup=ReplyKeyboardMarkup([["🔴 بازگشت"]], resize_keyboard=True)
+        )
+    
+    elif text == "🟣 درخواست نمایندگی":
+        await message.reply_text(
+            "🤝 ثبت درخواست نمایندگی:\n\n"
+            "برای ثبت درخواست، لطفاً **یوزرنیم** خود را ارسال کنید:\n"
+            "مثال: @your_username\n\n"
+            "📋 شرایط:\n"
+            "• حداقل ۲۰ مشتری فعال\n"
+            "• داشتن کانال تلگرامی\n"
+            "• آشنایی با کانفیگ‌ها",
+            reply_markup=ReplyKeyboardMarkup([["🔴 بازگشت"]], resize_keyboard=True)
+        )
+    
+    elif text == "🔴 بازگشت":
+        await message.reply_text("🏠 منوی اصلی:", reply_markup=get_main_keyboard())
+    
+    elif text == "🔴 انصراف":
+        await message.reply_text("✅ انصراف انجام شد.", reply_markup=get_main_keyboard())
+    
+    else:
+        # ===== ارسال پیام متنی به ادمین =====
+        if user.id != ADMIN_ID:
+            # ذخیره تیکت
+            data = load_data()
+            if user_id in data:
+                if "tickets" not in data[user_id]:
+                    data[user_id]["tickets"] = []
+                ticket_id = len(data[user_id]["tickets"]) + 1
+                data[user_id]["tickets"].append({
+                    "id": ticket_id,
+                    "message": text,
+                    "date": datetime.now().isoformat(),
+                    "status": "open"
+                })
+                save_data(data)
+            
+            # ارسال به ادمین
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"📩 پیام جدید از کاربر:\n\n"
+                    f"👤 کاربر: @{user.username or 'ندارد'}\n"
+                    f"🆔 آیدی: {user.id}\n"
+                    f"📅 تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                    f"📝 متن پیام:\n{text}\n\n"
+                    f"💡 برای پاسخ: /reply {user.id} [متن پاسخ]"
+                )
+            )
+            
+            await message.reply_text(
+                f"✅ پیام شما با موفقیت به پشتیبان ارسال شد.\n\n"
+                f"📌 شماره پیگیری: #TICKET-{str(user.id)[-4:]}\n"
+                f"⏳ در اسرع وقت پاسخ داده میشه.",
+                reply_markup=get_main_keyboard()
+            )
+        else:
+            # ===== دستورات ادمین =====
+            if text.startswith("/reply "):
+                parts = text.split(" ", 2)
+                if len(parts) >= 3:
+                    target_user_id = parts[1]
+                    reply_text = parts[2]
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(target_user_id),
+                            text=f"📩 پاسخ از پشتیبان:\n\n{reply_text}"
+                        )
+                        await message.reply_text("✅ پاسخ شما با موفقیت ارسال شد.")
+                    except Exception as e:
+                        await message.reply_text(f"❌ خطا: {e}")
+            else:
+                await message.reply_text(
+                    "⚠️ دستور نامعتبر!\n"
+                    "/reply [USER_ID] [متن پاسخ]"
+                )
 
-# -------------------- Flask Web Server --------------------
-app = Flask(__name__)
+async def show_payment_page(update: Update, choice: dict):
+    payment_text = (
+        f"💳 تکمیل خرید:\n\n"
+        f"📦 اشتراک: {choice['label']}\n"
+        f"💰 مبلغ: {choice['price']:,} تومان\n\n"
+        f"🏦 اطلاعات واریز:\n"
+        f"شماره کارت: **6037-9912-3456-7890**\n"
+        f"به نام: [نام صاحب حساب]\n"
+        f"بانک: [نام بانک]\n\n"
+        f"📌 مراحل:\n"
+        f"1️⃣ مبلغ دقیق رو به کارت بالا واریز کنید\n"
+        f"2️⃣ رسید رو در همین صفحه ارسال کنید\n"
+        f"3️⃣ ظرف چند دقیقه تایید و کانفیگ رو دریافت میکنید"
+    )
+    
+    await update.message.reply_text(payment_text, reply_markup=get_payment_keyboard())
 
-@app.route('/')
-@app.route('/health')
-def health_check():
-    """مسیر Health Check برای جلوگیری از خوابیدن ربات"""
-    return jsonify({
-        "status": "healthy",
-        "bot": "ربات فروش کانفیگ",
-        "message": "ربات در حال اجراست! ✅"
-    }), 200
+# ============================================
+# Flask (فقط برای Health Check)
+# ============================================
+
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "🤖 Bot is running with Polling!", 200
+
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "ok", "time": datetime.now().isoformat()}), 200
 
 def run_flask():
-    """اجرای وب‌سرور Flask در یک ترد جداگانه"""
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    try:
+        logger.info(f"🔥 Flask در حال اجرا روی پورت {PORT} (برای Health Check)")
+        flask_app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
+    except Exception as e:
+        logger.error(f"❌ خطای Flask: {e}")
 
-# -------------------- تابع اصلی --------------------
-def main() -> None:
-    """تابع اصلی - راه‌اندازی ربات"""
-    
-    # راه‌اندازی وب‌سرور Flask
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("وب‌سرور Flask راه‌اندازی شد")
-    
-    # ایجاد اپلیکیشن تلگرام
+# ============================================
+# تابع اصلی
+# ============================================
+
+def main():
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # ثبت هندلرها
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("reply", reply_to_user))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_message))
     
-    # Callback Query Handler
-    application.add_handler(CallbackQueryHandler(callback_handler))
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask thread شروع شد")
     
-    # Message Handlers
-    application.add_handler(MessageHandler(
-        filters.PHOTO & ~filters.COMMAND, 
-        handle_receipt
-    ))
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
-        handle_ticket
-    ))
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
-        handle_agency
-    ))
-    # توجه: این هندلرها به ترتیب اولویت بررسی می‌شوند
-    
-    # هندلر خطا
-    application.add_error_handler(error_handler)
-    
-    # راه‌اندازی ربات
-    logger.info("ربات فروش کانفیگ راه‌اندازی شد...")
+    logger.info("🤖 ربات شروع به کار کرد (Polling)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("🛑 برنامه با Ctrl+C متوقف شد")
+    except Exception as e:
+        logger.error(f"❌ خطای اجرا: {e}")
+        time.sleep(5)
+        os.execv(sys.executable, ['python'] + sys.argv)
